@@ -184,7 +184,7 @@ impl MoveOverhead {
 
 impl Default for MoveOverhead {
     fn default() -> Self {
-        Self::new(800)
+        Self::new(900)
     }
 }
 
