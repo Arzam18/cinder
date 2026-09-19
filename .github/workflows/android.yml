@@ -6,7 +6,7 @@ on:
       uci_date:
         description: "UCI version/date"
         required: true
-        default: "20260918"
+        default: "20260919"
 
 permissions:
   contents: write
@@ -32,17 +32,33 @@ jobs:
 
           date = os.environ["UCI_DATE"]
 
-          path = Path("src/uci.rs")
-          text = path.read_text()
-
           old = 'writeln!(f, "id name Cinder {}", env!("CARGO_PKG_VERSION"))?;'
           new = f'writeln!(f, "id name Cinder {{}}", "{date}")?;'
 
-          if old not in text:
-              raise SystemExit(f"Could not find expected version line in {path}")
+          matches = []
 
+          for path in Path(".").rglob("*.rs"):
+              if "target" in path.parts:
+                  continue
+
+              try:
+                  text = path.read_text()
+              except (UnicodeDecodeError, OSError):
+                  continue
+
+              if old in text:
+                  matches.append(path)
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"Expected exactly 1 matching UCI version line, found {len(matches)}: {matches}"
+              )
+
+          path = matches[0]
+          text = path.read_text()
           path.write_text(text.replace(old, new, 1))
-          print(f"Patched Cinder UCI version to {date}")
+
+          print(f"Patched UCI version in {path} to {date}")
           PY
 
       - name: Setup Rust
