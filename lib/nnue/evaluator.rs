@@ -65,7 +65,10 @@ enum Pending {
 #[debug("Evaluator({})", self.deref())]
 pub struct Evaluator {
     ply: Ply,
+    game_ply: usize,
+    plies_since_pass: [Halfmove; Ply::LEN],
     positions: [Position; Ply::LEN],
+    history: [Zobrist; Halfmove::MAX as usize + Ply::LEN],
     accumulator: [[Accumulator; Ply::LEN]; Color::LEN],
     pending: [[Pending; Ply::LEN]; Color::LEN],
     cache: [[CachedAccumulator; KingBucket::LEN]; Color::LEN],
@@ -159,12 +162,16 @@ impl Evaluator {
     pub fn new(pos: Position) -> Self {
         let mut evaluator = Evaluator {
             ply: zeroed(),
+            game_ply: zeroed(),
+            plies_since_pass: zeroed(),
             positions: [pos; Ply::LEN],
+            history: zeroed(),
             accumulator: zeroed(),
             pending: zeroed(),
             cache: Default::default(),
         };
 
+        *evaluator.history.get_mut(Halfmove::MAX as usize).assume() = pos.zobrists().hash;
         evaluator.reset();
         evaluator
     }
@@ -174,6 +181,130 @@ impl Evaluator {
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn ply(&self) -> Ply {
         self.ply
+    }
+
+    /// Whether `m` is reversible.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn is_reverting(&self, m: Move) -> bool {
+        let (wc, wt) = (m.whence(), m.whither());
+        if Bitboard::segment(wc, wt) & self.occupied() != zeroed() {
+            return false;
+        }
+
+        let sq = match (self[wc].is_empty(), self[wt].is_empty()) {
+            (false, true) => wc,
+            (true, false) => wt,
+            _ => return false,
+        };
+
+        self[sq].color() == Some(self.turn())
+    }
+
+    /// Zobrist hashes within the repetition horizon.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn repetition_window(&self) -> &[Zobrist] {
+        let ply = self.ply.cast::<usize>();
+        let game_ply = self.game_ply.min(Halfmove::MAX.cast()) + ply;
+        let plies_since_pass = self.plies_since_pass[self.ply].cast::<usize>();
+        let hm = self.halfmove().cast::<usize>();
+        let end = Halfmove::MAX.cast::<usize>() + ply + 1;
+        let len = hm.min(plies_since_pass).min(game_ply) + 1;
+        self.history.get(end - len..end).assume()
+    }
+
+    /// Whether a reverting move reaches a repeated position next ply.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn has_upcoming_repetition(&self) -> bool {
+        #[inline(never)]
+        fn repeats(window: &[Zobrist], dist: usize) -> bool {
+            let end = window.len() - 1;
+            let ancestor = *window.get(end - dist).assume();
+
+            let mut d = 1;
+            while d <= end {
+                if d != dist && *window.get(end - d).assume() == ancestor {
+                    return true;
+                } else {
+                    d += 2;
+                }
+            }
+
+            false
+        }
+
+        let ply = self.ply.cast::<usize>();
+        let window = self.repetition_window();
+        let end = window.len() - 1;
+        if end < 3 {
+            return false;
+        }
+
+        let current = *window.last().assume();
+        let mut other = current ^ *window.get(end - 1).assume() ^ ZobristNumbers::turn();
+
+        let mut dist = 3;
+        while dist <= end {
+            let ancestor = *window.get(end - dist).assume();
+            let successor = *window.get(end - dist + 1).assume();
+            other ^= successor ^ ancestor ^ ZobristNumbers::turn();
+
+            let diff = current ^ ancestor;
+            if other == zeroed() && Cuckoo::find(diff).is_some_and(|m| self.is_reverting(m)) {
+                if dist < ply || repeats(window, dist) {
+                    return true;
+                }
+            }
+
+            dist += 2;
+        }
+
+        false
+    }
+
+    /// Whether the game is a draw by repetition.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn is_draw_by_repetition(&self) -> bool {
+        let window = self.repetition_window();
+        let end = window.len() - 1;
+        if end >= 4 {
+            let hash = window.last().assume();
+            let ply = self.ply.cast::<usize>();
+
+            let mut count = 0;
+            let mut dist = 4;
+            while dist <= end {
+                if window.get(end - dist).assume() == hash {
+                    count += 1;
+                    if dist < ply || count == 2 {
+                        return true;
+                    }
+                }
+
+                dist += 2;
+            }
+        }
+
+        false
+    }
+
+    /// The [`Outcome`] of the game in case this position is final.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn outcome(&self) -> Option<Outcome> {
+        match self.positions[self.ply].outcome() {
+            Some(o) => Some(o),
+            None => {
+                if self.is_draw_by_repetition() {
+                    Some(Outcome::Draw)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Estimates the material gain of a move.
@@ -267,18 +398,26 @@ impl Evaluator {
         self.pending[0][self.ply] = Pending::Update;
         self.pending[1][self.ply] = Pending::Update;
         self.positions[self.ply] = self.positions[self.ply - 1];
-
-        let Some(m) = m else {
-            return self.positions[self.ply].pass();
+        self.plies_since_pass[self.ply] = match m {
+            Some(_) => self.plies_since_pass[self.ply - 1] + 1,
+            None => zeroed(),
         };
 
-        let turn = self.turn();
-        self.positions[self.ply].play(m);
-        if self[m.whither()].role() == Some(Role::King) {
-            if KingBucket::new(turn, m.whence()) != KingBucket::new(turn, m.whither()) {
-                self.pending[turn][self.ply] = Pending::Refresh;
+        match m {
+            None => self.positions[self.ply].pass(),
+            Some(m) => {
+                let turn = self.turn();
+                self.positions[self.ply].play(m);
+                if self[m.whither()].role() == Some(Role::King) {
+                    if KingBucket::new(turn, m.whence()) != KingBucket::new(turn, m.whither()) {
+                        self.pending[turn][self.ply] = Pending::Refresh;
+                    }
+                }
             }
         }
+
+        let idx = Halfmove::MAX.cast::<usize>() + self.ply.cast::<usize>();
+        *self.history.get_mut(idx).assume() = self.positions[self.ply].zobrists().hash;
     }
 
     /// Pops a [`Position`] from the evaluator stack.
@@ -294,7 +433,10 @@ impl Evaluator {
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn reset(&mut self) {
         if self.ply > 0 {
+            self.game_ply += self.ply.cast::<usize>();
+            self.plies_since_pass[0] = self.plies_since_pass[self.ply];
             self.positions[0] = self.positions[self.ply];
+            self.history.rotate_left(self.ply.cast());
             self.ply = zeroed();
         }
 
@@ -489,7 +631,7 @@ where
 #[inline(always)]
 #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
 fn ppfts(pfts: u8x64, remaining: M8x64, diff: M8x64) -> impl Iterator<Item = PPFeature> {
-    let mut ppfts = StaticSeq::<u16, 128>::new();
+    let mut ppfts = StaticSeq::<u16, { PPFeature::MAX_ACTIVE + 32 }>::new();
     let mut remaining = Bitboard::from(remaining);
     for s in remaining & diff {
         remaining &= !s.bitboard();
@@ -544,6 +686,17 @@ impl FromStr for Evaluator {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(s.parse()?))
+    }
+}
+
+#[cfg(feature = "trainer")]
+use bullet::game::formats::bulletformat::ChessBoard;
+
+#[cfg(feature = "trainer")]
+impl From<ChessBoard> for Evaluator {
+    #[inline(always)]
+    fn from(pos: ChessBoard) -> Self {
+        Self::new(Position::from(pos))
     }
 }
 
