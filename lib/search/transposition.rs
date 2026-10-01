@@ -3,8 +3,8 @@ use crate::search::{Depth, Line, Ply, Pv, Score};
 use crate::util::{Assume, Binary, Bits, Int, Num};
 use bytemuck::{NoUninit, Zeroable, zeroed};
 use derive_more::with_trait::Debug;
-use std::hint::unreachable_unchecked;
 use std::ops::{Range, RangeInclusive};
+use std::{cmp::Ordering, hint::unreachable_unchecked};
 
 /// The transposition age.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, NoUninit)]
@@ -20,6 +20,16 @@ const unsafe impl Num for Age {
 
 const unsafe impl Int for Age {}
 
+impl Age {
+    /// How many generations elapse from `self` to `other`.
+    #[inline(always)]
+    pub fn distance(self, other: Self) -> Self {
+        let cycle = Age::MAX.cast::<i16>() + 1;
+        let (a, b) = (self.cast::<i16>(), other.cast::<i16>());
+        (cycle + b - a).rem_euclid(cycle).saturate()
+    }
+}
+
 impl Binary for Age {
     type Bits = Bits<u8, 4>;
 
@@ -32,6 +42,48 @@ impl Binary for Age {
     fn decode(bits: Self::Bits) -> Self {
         bits.convert().assume()
     }
+}
+
+/// How good a [`Transposition`] is.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Zeroable, NoUninit)]
+#[cfg_attr(test, derive(test_strategy::Arbitrary))]
+#[repr(transparent)]
+pub struct Quality(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <Quality as Num>::Repr);
+
+const unsafe impl Num for Quality {
+    type Repr = i16;
+    const MIN: Self::Repr = Self::Repr::MIN;
+    const MAX: Self::Repr = Self::Repr::MAX;
+}
+
+/// Semi-order that requires overwhelming superiority.
+impl PartialOrd for Quality {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        const MARGIN: i16 = 4;
+
+        if self.0 == other.0 {
+            Some(Ordering::Equal)
+        } else if self.0 > other.0.saturating_add(MARGIN) {
+            Some(Ordering::Greater)
+        } else if self.0.saturating_add(MARGIN) < other.0 {
+            Some(Ordering::Less)
+        } else {
+            None
+        }
+    }
+}
+
+/// How much a transposition is worth to the current search.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, NoUninit)]
+#[cfg_attr(test, derive(test_strategy::Arbitrary))]
+#[repr(transparent)]
+pub struct Relevance(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <Relevance as Num>::Repr);
+
+const unsafe impl Num for Relevance {
+    type Repr = i16;
+    const MIN: Self::Repr = Self::Repr::MIN;
+    const MAX: Self::Repr = Self::Repr::MAX;
 }
 
 /// Whether the transposed score is exact or a bound.
@@ -184,6 +236,26 @@ impl Transposition {
             self.score.bound(ply),
             self.best.map_or_else(Line::empty, Line::singular),
         )
+    }
+
+    /// Whether this entry was written during the given `age`.
+    #[inline(always)]
+    pub fn is_live(self, age: Age) -> bool {
+        self.age == age
+    }
+
+    /// How good this entry is.
+    #[inline(always)]
+    pub fn quality(self) -> Quality {
+        self.depth.saturate()
+    }
+
+    /// How much this entry is worth to the search at a given `age`.
+    #[inline(always)]
+    pub fn relevance(self, age: Age) -> Relevance {
+        let depth = self.depth.cast::<i16>();
+        let age = self.age.distance(age).cast::<i16>();
+        (depth - age).saturate()
     }
 }
 
