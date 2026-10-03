@@ -419,7 +419,7 @@ impl<'a> Searcher<'a> {
     /// The mate distance pruning.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn mdp(&self, bounds: &Range<Score>) -> (Score, Score) {
+    fn mdp(&self, bounds: Range<Score>) -> (Score, Score) {
         let ply = self.stack.pos.ply();
         let lower = Score::mated(ply);
         let upper = Score::mating(ply + 1); // One can't mate in 0 plies!
@@ -559,7 +559,7 @@ impl<'a> Searcher<'a> {
             return Ok(Pv::empty(Score::drawn()));
         }
 
-        let (mut alpha, beta) = self.mdp(&bounds);
+        let (mut alpha, beta) = self.mdp(bounds);
         let has_upcoming_repetition = self.stack.pos.has_upcoming_repetition();
         if has_upcoming_repetition {
             alpha = alpha.max(Score::drawn());
@@ -582,16 +582,12 @@ impl<'a> Searcher<'a> {
 
         let is_check = self.stack.pos.is_check();
         let value = self.stack.value(0).assume();
-        let mut stand_pat = match transposition {
+        let stand_pat = match transposition {
             _ if is_check => Score::lower(),
             Some(t) if t.score.bound(ply).is_decisive() => value,
             Some(t) if !t.score.range(ply).contains(&value) => t.score.bound(ply),
             _ => value,
         };
-
-        if has_upcoming_repetition && !is_check {
-            stand_pat = stand_pat.max(Score::drawn());
-        }
 
         if ply >= Ply::MAX {
             return if is_check {
@@ -633,7 +629,7 @@ impl<'a> Searcher<'a> {
                 let delta = alpha - value;
                 let margin = delta.cast::<f32>() - Params::futility_margin_quiescence(0);
                 if margin >= 0.0 && !pos.gaining(m, margin) {
-                    break;
+                    continue;
                 }
             }
 
@@ -657,8 +653,6 @@ impl<'a> Searcher<'a> {
 
         let score = if tail >= beta {
             ScoreBound::lower_bound(tail.score(), ply)
-        } else if has_upcoming_repetition && !is_check {
-            ScoreBound::lower_bound(Score::drawn(), ply)
         } else {
             ScoreBound::upper_bound(tail.score(), ply)
         };
@@ -689,7 +683,7 @@ impl<'a> Searcher<'a> {
             return Ok(Pv::empty(Score::drawn()));
         }
 
-        let (mut alpha, beta) = self.mdp(&bounds);
+        let (mut alpha, beta) = self.mdp(bounds);
         let has_upcoming_repetition = self.stack.pos.has_upcoming_repetition();
         if has_upcoming_repetition {
             alpha = alpha.max(Score::drawn());
@@ -712,15 +706,11 @@ impl<'a> Searcher<'a> {
 
         let is_check = self.stack.pos.is_check();
         let value = self.stack.value(0).assume();
-        let mut stand_pat = match transposition {
+        let stand_pat = match transposition {
             _ if is_check => Score::lower(),
-            Some(t) => t.score.bound(ply),
+            Some(t) if !t.score.range(ply).contains(&value) => t.score.bound(ply),
             _ => value,
         };
-
-        if has_upcoming_repetition && !is_check {
-            stand_pat = stand_pat.max(Score::drawn());
-        }
 
         if ply >= Ply::MAX {
             return if is_check {
@@ -857,8 +847,8 @@ impl<'a> Searcher<'a> {
                     drop(next);
                     if pv >= pc_beta {
                         let pv = pv.clip(lower, upper);
-                        let score = ScoreBound::new(bounds, pv.score(), ply);
-                        let depth = Params::probcut_depth_bonus(0).add(depth).saturate();
+                        let score = ScoreBound::new(alpha..beta, pv.score(), ply);
+                        let depth = Params::probcut_depth_bonus(0).add(pc_depth).saturate();
                         let tpos = Transposition::new(score, depth, Some(m), IS_PV || was_pv);
                         self.shared.tt.store(self.stack.pos.zobrists().hash, tpos);
                         return Ok(pv.truncate().transpose(m));
@@ -887,8 +877,8 @@ impl<'a> Searcher<'a> {
                         let se_beta = t.score.bound(ply) - margin.cast::<i16>();
 
                         let mut se_score = Score::lower();
-                        for m in moves.sorted(self, Some(m)).skip(1) {
-                            let mut next = self.next(Some(m));
+                        for n in moves.sorted(self, Some(m)).skip(1) {
+                            let mut next = self.next(Some(n));
                             let pv = -next.nw(se_depth - 1.0, -se_beta + 1, !is_cut)?;
                             se_score = pv.score().max(se_score);
                             if se_score.min(se_beta) >= beta {
@@ -1024,7 +1014,7 @@ impl<'a> Searcher<'a> {
         }
 
         let tail = tail.lower(upper);
-        let score = ScoreBound::new(bounds, tail.score(), ply);
+        let score = ScoreBound::new(alpha..beta, tail.score(), ply);
         let tpos = Transposition::new(score, depth.saturate(), Some(head), IS_PV || was_pv);
         self.shared.tt.store(self.stack.pos.zobrists().hash, tpos);
 
@@ -1116,7 +1106,7 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        let score = ScoreBound::new(bounds, tail.score(), zeroed());
+        let score = ScoreBound::new(alpha..beta, tail.score(), zeroed());
         let tpos = Transposition::new(score, depth.saturate(), Some(head), true);
         self.shared.tt.store(self.stack.pos.zobrists().hash, tpos);
 
