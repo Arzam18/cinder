@@ -1,0 +1,92 @@
+name: Build Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      uci_date:
+        description: "UCI version/date"
+        required: true
+        default: "20261010"
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Patch UCI Version
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          date = os.environ["UCI_DATE"]
+
+          old = 'writeln!(f, "id name Cinder {}", env!("CARGO_PKG_VERSION"))?;'
+          new = f'writeln!(f, "id name Cinder {{}}", "{date}")?;'
+
+          matches = []
+
+          for path in Path(".").rglob("*.rs"):
+              if "target" in path.parts:
+                  continue
+
+              try:
+                  text = path.read_text()
+              except (UnicodeDecodeError, OSError):
+                  continue
+
+              if old in text:
+                  matches.append(path)
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"Expected exactly 1 matching UCI version line, found {len(matches)}: {matches}"
+              )
+
+          path = matches[0]
+          text = path.read_text()
+          path.write_text(text.replace(old, new, 1))
+
+          print(f"Patched UCI version in {path} to {date}")
+          PY
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Ensure Target for Active Toolchain
+        run: rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Cinder for Android
+        run: |
+          # Uses Cinder's custom dist profile and target binary name
+          cargo ndk -t arm64-v8a --platform 24 build --profile dist --bin cinder --config 'build.rustflags=[]'
+          
+          mkdir -p dist/bin
+          cp target/aarch64-linux-android/dist/cinder dist/bin/cinder
+
+      - name: Verify Binary
+        run: |
+          ls -lh dist/bin/
+          file dist/bin/*
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cinder-android-arm64
+          path: dist/bin/*
