@@ -6,7 +6,7 @@ on:
       uci_date:
         description: "UCI version/date"
         required: true
-        default: "20261010"
+        default: "20261013"
 
 permissions:
   contents: write
