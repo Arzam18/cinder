@@ -27,7 +27,7 @@ const impl<T: NoUninit, const N: usize, const S: usize> From<[T; N]> for Bytes<C
         const { assert!(!needs_drop::<T>()) }
 
         Bytes {
-            len: N.convert().assume(),
+            len: Num::new(N.cast()),
             mem: data.into(),
         }
     }
@@ -130,12 +130,43 @@ const impl<T, M: [const] Memory<T, Capacity = ConstCapacity>> Seq<T, M> {
         self.len() == 0
     }
 
+    /// Returns a raw pointer to the sequence's full capacity.
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const T {
+        // IMPORTANT: do not go through trait Deref to preserve provenance to the whole memory range.
+        self.bytes.mem.as_ref().as_ptr().cast()
+    }
+
+    /// Returns a mutable raw pointer to the sequence's full capacity.
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        // IMPORTANT: do not go through trait DerefMut to preserve provenance to the whole memory range.
+        self.bytes.mem.as_mut().as_mut_ptr().cast()
+    }
+
     /// Pushes a new item into this sequence.
     #[inline(always)]
     pub fn push(&mut self, item: T) {
         let idx = self.len();
-        self.bytes.len = self.bytes.len.checked_add(ones(1)).assume();
+        self.bytes.len = self.bytes.len.checked_add(1).assume();
         self.bytes.mem.as_mut().get_mut(idx).assume().write(item);
+    }
+
+    /// Pushes `item` if it is [`Some`].
+    ///
+    /// The sequence must have spare capacity even when `item` is [`None`].
+    #[inline(always)]
+    pub fn push_maybe(&mut self, item: Option<T>)
+    where
+        T: Zeroable + Copy,
+    {
+        let idx = self.len();
+        (idx < self.capacity()).assume();
+
+        let is_present = item.is_some().cast();
+        let value = item.unwrap_or_else(zeroed);
+        self.bytes.len = self.bytes.len.checked_add(is_present).assume();
+        self.bytes.mem.as_mut().get_mut(idx).assume().write(value);
     }
 
     /// Pops an item from the back of this sequence.
@@ -176,10 +207,10 @@ const impl<T, M: [const] Memory<T, Capacity = ConstCapacity>> Seq<T, M> {
 }
 
 impl<T, M: Memory<T, Capacity = ConstCapacity>> Seq<T, M> {
-    /// Extends this sequence with the elements in a `Simd` vector.
+    /// Extends this sequence with the elements in a `Simd` vector enabled by `mask`.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    pub fn extend_from_simd<E, const N: usize>(
+    pub fn extend_from_simd_masked<E, const N: usize>(
         &mut self,
         vec: Simd<E, N>,
         mask: <Simd<E, N> as Compress>::Bitmask,
@@ -195,6 +226,24 @@ impl<T, M: Memory<T, Capacity = ConstCapacity>> Seq<T, M> {
         let ptr = self.as_mut_ptr().wrapping_add(end).cast();
         vec.compress_store(mask, unsafe { slice::from_raw_parts_mut(ptr, N) });
         unsafe { self.resize(end + mask.count_ones().cast::<usize>()) };
+    }
+
+    /// Extends this sequence with the first `len` elements of a `Simd` vector.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn extend_from_simd<E, const N: usize>(&mut self, vec: Simd<E, N>, len: usize)
+    where
+        E: SimdElement,
+    {
+        const { assert!(align_of::<T>() >= align_of::<E>()) }
+        const { assert!(size_of::<T>() == size_of::<E>()) }
+        (self.capacity() >= self.len() + N).assume();
+        (len <= N).assume();
+
+        let end = self.len();
+        let ptr = self.as_mut_ptr().wrapping_add(end).cast();
+        vec.copy_to_slice(unsafe { slice::from_raw_parts_mut(ptr, N) });
+        unsafe { self.resize(end + len) };
     }
 }
 
@@ -491,6 +540,21 @@ mod tests {
 
         assert_eq!(seq.len(), len + 1);
         assert_eq!(seq.last().copied(), Some(e));
+    }
+
+    #[proptest]
+    fn push_maybe_appends_element_if_some(
+        #[filter(#seq.capacity() > #seq.len())] mut seq: StaticSeq<u32, 16>,
+        e: Option<u32>,
+    ) {
+        let len = seq.len();
+        seq.push_maybe(e);
+
+        assert_eq!(seq.len(), len + e.is_some().cast::<usize>());
+
+        if e.is_some() {
+            assert_eq!(seq.last().copied(), e);
+        }
     }
 
     #[proptest]

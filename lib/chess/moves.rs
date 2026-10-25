@@ -2,7 +2,7 @@ use crate::{chess::*, simd::*, util::*};
 use bytemuck::{ZeroableInOption, zeroed};
 use derive_more::with_trait::{Deref, DerefMut, IntoIterator};
 use std::fmt::{self, Debug, Display, Formatter, Write};
-use std::{convert::Infallible, iter::FusedIterator, num::NonZeroU16};
+use std::{array, convert::Infallible, iter::FusedIterator, num::NonZeroU16};
 
 #[cfg(test)]
 use proptest::{collection::vec, prelude::*};
@@ -39,7 +39,7 @@ const impl Move {
         bits.push(PROMOTIONS[promotion.unwrap_or(Role::King)]);
         bits.push(whither.encode());
         bits.push(whence.encode());
-        Move(bits.convert().assume())
+        Move(Num::new(bits.get()))
     }
 
     /// Constructs a capture move.
@@ -127,12 +127,12 @@ const impl Binary for Move {
 
     #[inline(always)]
     fn encode(&self) -> Self::Bits {
-        self.0.convert().assume()
+        Num::new(self.0.get())
     }
 
     #[inline(always)]
     fn decode(bits: Self::Bits) -> Self {
-        Move(bits.convert().assume())
+        Move(Num::new(bits.get()))
     }
 }
 
@@ -229,9 +229,24 @@ impl RatedMoves {
     /// Re-rates all [`Move`]s in this collection.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    pub fn rate<F: FnMut(Move) -> Rating>(&mut self, mut f: F) {
+    pub fn rate<F: FnMut(Move) -> Rating>(&mut self, f: F) {
+        self.rate_with_head(None, f);
+    }
+
+    /// Re-rates all [`Move`]s in this collection, promoting `head` to the front.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn rate_with_head<F: FnMut(Move) -> Rating>(&mut self, head: Option<Move>, mut f: F) {
         self.unsorted = 0;
-        for (m, rating) in self.moves.iter().zip(&mut self.ratings) {
+
+        if let Some(i) = head.and_then(|h| self.moves.iter().position(|&m| m == h)) {
+            self.ratings[0] = Rating::upper();
+            self.moves.swap(0, i);
+            self.unsorted = 1;
+        }
+
+        let start = self.unsorted.cast::<usize>();
+        for (m, rating) in self.moves[start..].iter().zip(&mut self.ratings[start..]) {
             *rating = f(*m);
         }
     }
@@ -282,9 +297,33 @@ impl Iterator for SortedRatedMovesIter<'_> {
             const SHIFT: u32 = 32 - <Rating as Num>::Repr::BITS;
             const { assert!(SHIFT >= Moves::CAPACITY.next_power_of_two().trailing_zeros()) }
 
-            let mut best = i32::MIN;
-            for (i, rating) in ratings.iter().enumerate() {
-                best = best.max((rating.cast::<i32>() << SHIFT) | i.cast::<i32>());
+            let (chunks, remainder) = ratings.as_chunks::<W2>();
+            let iota = V2::<i32>::from_array(array::from_fn(Num::cast));
+            let shift = V2::<i32>::splat(1 << SHIFT);
+            let step = V2::<i32>::splat(W2.cast());
+            let mut best = V2::splat(i32::MIN);
+            let mut ids = iota;
+
+            for chunk in chunks {
+                let chunk = V2::from_array(chunk.map(Num::get)).cast::<i32>();
+                best = best.simd_max((chunk * shift) | ids);
+                ids += step;
+            }
+
+            if !remainder.is_empty() && ratings.len() >= W2 {
+                let start = ratings.len() - W2;
+                let (tail, _) = ratings[start..].as_chunks::<W2>();
+                let chunk = V2::from_array(tail[0].map(Num::get)).cast::<i32>();
+                let ids = V2::<i32>::splat(start.cast()) + iota;
+                best = best.simd_max((chunk * shift) | ids);
+            }
+
+            let mut best = best.reduce_max();
+
+            if ratings.len() < W2 {
+                for (i, rating) in ratings.iter().enumerate() {
+                    best = best.max((rating.cast::<i32>() << SHIFT) | i.cast::<i32>());
+                }
             }
 
             let idx = cursor + (best.cast::<usize>() & ones::<usize>(SHIFT));
@@ -370,12 +409,12 @@ impl MoveCollector for Moves {
 
         for wt in targets & theirs {
             let moves = squares | u16x16::splat(((wt as u16) << 6) | 0b1000000000000000);
-            self.0.extend_from_simd(moves, attacks[wt].cast());
+            self.0.extend_from_simd_masked(moves, attacks[wt].cast());
         }
 
         for wt in targets & !theirs {
             let moves = squares | u16x16::splat((wt as u16) << 6);
-            self.0.extend_from_simd(moves, attacks[wt].cast());
+            self.0.extend_from_simd_masked(moves, attacks[wt].cast());
         }
 
         Ok(())
@@ -438,7 +477,7 @@ impl MoveCollector for Moves {
 
             let expanded_mask = u32::from_le_bytes(packed.to_array());
             let moves = PUSHES[turn].cast_ref::<u16x32>();
-            self.0.extend_from_simd(*moves, expanded_mask);
+            self.0.extend_from_simd_masked(*moves, expanded_mask);
         }
 
         let theirs = pos.by_color(!turn);
@@ -515,7 +554,7 @@ impl MoveCollector for Moves {
 
         if mask != 0 {
             let moves = SINGLE[turn].cast_ref::<u16x32>();
-            self.0.extend_from_simd(*moves, mask);
+            self.0.extend_from_simd_masked(*moves, mask);
         }
 
         let double = match turn {
@@ -528,7 +567,7 @@ impl MoveCollector for Moves {
 
         if mask != 0 {
             let moves = DOUBLE[turn].cast_ref::<u16x16>();
-            self.0.extend_from_simd(*moves, mask);
+            self.0.extend_from_simd_masked(*moves, mask);
         }
 
         Ok(())

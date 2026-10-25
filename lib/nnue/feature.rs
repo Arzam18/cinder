@@ -1,11 +1,11 @@
 use crate::util::{Assume, Int, Num, ones};
 use crate::{chess::*, nnue::arch, simd::*};
-use bytemuck::zeroed;
+use bytemuck::{Zeroable, zeroed};
 use std::array;
-use std::ops::{BitAnd, Index, IndexMut, Not};
+use std::ops::{Index, IndexMut, Not};
 
 /// A piece-square feature with merged kings and horizontal mirroring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable)]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 #[repr(transparent)]
 pub struct PSQFeature(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <PSQFeature as Num>::Repr);
@@ -21,28 +21,6 @@ const unsafe impl Int for PSQFeature {}
 impl PSQFeature {
     /// The total number of different piece-square features.
     pub const LEN: usize = Square::LEN * (Piece::LEN - 1);
-
-    /// Constructs a lookup table for [`PSQFeature`].
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    pub fn lut(
-        side: Color,
-        ksq: Square,
-        placement: &Placement,
-    ) -> Simd<<Self as Num>::Repr, { Square::LEN }> {
-        let perspective = Square::A1.perspective(side);
-        let chirality = Square::A1.perspective(Side::from(ksq.file() < File::E));
-        let orientation = Simd::splat(perspective.cast::<u8>() | chirality.cast::<u8>());
-        let squares = u8x64::from_array(array::from_fn(Num::cast)) ^ orientation;
-
-        let pieces = Piece::DECODER.shuffle(placement.pieces()) ^ Simd::splat(side.get());
-        let kings = pieces.simd_eq(Simd::splat(Piece::WhiteKing.cast()))
-            | pieces.simd_eq(Simd::splat(Piece::BlackKing.cast()));
-
-        // Merge kings
-        let pieces = kings.select(Simd::splat(Piece::WhiteKing.cast()), pieces);
-        u16x64::splat(Square::LEN.cast()) * pieces.cast::<u16>() + squares.cast::<u16>()
-    }
 }
 
 impl<T> Index<PSQFeature> for [T; PSQFeature::LEN] {
@@ -62,7 +40,7 @@ impl<T> IndexMut<PSQFeature> for [T; PSQFeature::LEN] {
 }
 
 /// The king's bucket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable)]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 #[repr(transparent)]
 pub struct KingBucket(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <KingBucket as Num>::Repr);
@@ -113,7 +91,7 @@ impl<T> IndexMut<KingBucket> for [T; KingBucket::LEN] {
 }
 
 /// A king-bucketed PSQ feature with merged kings and horizontal mirroring..
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable)]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 #[repr(transparent)]
 pub struct KAFeature(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <KAFeature as Num>::Repr);
@@ -136,17 +114,57 @@ impl KAFeature {
     /// The maximum number of active king-piece-square features per perspective.
     pub const MAX_ACTIVE: usize = 32;
 
-    /// Constructs a lookup table for [`KAFeature`].
+    /// Compresses the squares and pieces enabled by `mask`.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn compress(pieces: u8x64, mask: M8x64) -> (u8x32, u8x32) {
+        let mask = mask.to_bitmask();
+        let squares = u8x64::from_array(array::from_fn(Num::cast));
+        let [squares, _] = squares.compress(mask).halve();
+        let [pieces, _] = pieces.compress(mask).halve();
+        (squares, pieces)
+    }
+
+    /// Constructs a lookup table for compressed [`KAFeature`]s.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn lut(
         side: Color,
         ksq: Square,
-        placement: &Placement,
-    ) -> Simd<<Self as Num>::Repr, { Square::LEN }> {
+        pieces: u8x32,
+        mut squares: u8x32,
+    ) -> Simd<<Self as Num>::Repr, { Self::MAX_ACTIVE }> {
+        /// Decodes a placement piece, flips perspective, and merges both kings.
+        const DECODER: [u8x32; Color::LEN] = const {
+            let mut decoders: [u8x32; Color::LEN] = zeroed();
+
+            for side in Color::iter() {
+                for piece in Piece::iter() {
+                    let decoded = if piece.role() != Role::King {
+                        piece.perspective(side)
+                    } else {
+                        Piece::WhiteKing
+                    };
+
+                    decoders[side].as_mut_array()[piece.cast::<usize>()] = decoded.cast();
+                    decoders[side].as_mut_array()[piece.cast::<usize>() + 16] = decoded.cast();
+                }
+            }
+
+            decoders
+        };
+
         let chirality = Side::from(ksq.file() < File::E);
-        let bucket = u16x64::splat(KingBucket::new(side, ksq.perspective(chirality)).cast());
-        u16x64::splat(PSQFeature::LEN.cast()) * bucket + PSQFeature::lut(side, ksq, placement)
+        let bucket = u16x32::splat(KingBucket::new(side, ksq.perspective(chirality)).cast());
+        let pieces = DECODER[side].shuffle(pieces).cast::<u16>();
+
+        let side = Square::A1.perspective(side);
+        let chirality = Square::A1.perspective(chirality);
+        squares ^= u8x32::splat(side.cast::<u8>() | chirality.cast::<u8>());
+
+        u16x32::splat(PSQFeature::LEN.cast()) * bucket
+            + u16x32::splat(Square::LEN.cast()) * pieces
+            + squares.cast::<u16>()
     }
 }
 
@@ -167,7 +185,7 @@ impl<T> IndexMut<KAFeature> for [T; KAFeature::LEN] {
 }
 
 /// A threat feature with horizontal mirroring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable)]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 #[repr(transparent)]
 pub struct TIFeature(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <TIFeature as Num>::Repr);
@@ -195,7 +213,11 @@ const fn threat_index_for(role: Role) -> [u16; 65] {
 
 impl TIFeature {
     #[expect(dead_code)]
-    const REQUIRES: () = const { assert!(Self::LEN == arch::TI) };
+    const REQUIRES: () = const {
+        assert!(Self::LEN == arch::TI);
+        assert!(Self::LEN <= u16::MAX as usize);
+        assert!(Self::LEN < Self::SENTINEL as usize);
+    };
 
     const PAWN_INDEX: u16 = 84;
     const KNIGHT_INDICES: [u16; 65] = threat_index_for(Role::Knight);
@@ -208,6 +230,71 @@ impl TIFeature {
     const ROOK_OFFSET: u16 = Self::BISHOP_OFFSET + 8 * Self::BISHOP_INDICES[64];
     const QUEEN_OFFSET: u16 = Self::ROOK_OFFSET + 8 * Self::ROOK_INDICES[64];
     const THREAT_FEATURES: u16 = Self::QUEEN_OFFSET + 10 * Self::QUEEN_INDICES[64];
+
+    const SENTINEL: u16 = 0xF000;
+    const OFFSET: [[u16; Square::LEN]; Piece::LEN] = const {
+        let mut table = [[0u16; Square::LEN]; Piece::LEN];
+
+        for src in Piece::iter() {
+            let indices = threat_index_for(src.role());
+
+            for wc in Square::iter() {
+                table[src][wc] = indices[wc.cast::<usize>()];
+            }
+        }
+
+        table
+    };
+
+    const BASE: [[[u16; 2]; Piece::LEN]; Piece::LEN] = const {
+        let mut table = [[[0u16; 2]; Piece::LEN]; Piece::LEN];
+
+        for src in Piece::iter() {
+            let indices = threat_index_for(src.role());
+            let color = src.color().cast::<u16>() * Self::THREAT_FEATURES;
+            let role = match src.role() {
+                Role::Pawn | Role::King => 0,
+                Role::Knight => Self::KNIGHT_OFFSET,
+                Role::Bishop => Self::BISHOP_OFFSET,
+                Role::Rook => Self::ROOK_OFFSET,
+                Role::Queen => Self::QUEEN_OFFSET,
+            };
+
+            for dst in Piece::iter() {
+                const P: [[Option<u16>; 6]; 2] = [
+                    [None, Some(0), None, Some(1), None, None],
+                    [None, Some(2), None, Some(3), None, None],
+                ];
+
+                const KQ: [[Option<u16>; 6]; 2] = [
+                    [Some(0), Some(1), Some(2), Some(3), Some(4), None],
+                    [Some(5), Some(6), Some(7), Some(8), Some(9), None],
+                ];
+
+                const BR: [[Option<u16>; 6]; 2] = [
+                    [Some(0), Some(1), Some(2), Some(3), None, None],
+                    [Some(4), Some(5), Some(6), Some(7), None, None],
+                ];
+
+                let stride = match src.role() {
+                    Role::Pawn => P[dst.color()][dst.role()],
+                    Role::Knight | Role::Queen => KQ[dst.color()][dst.role()],
+                    Role::Bishop | Role::Rook => BR[dst.color()][dst.role()],
+                    Role::King => None,
+                };
+
+                for semi in 0..2 {
+                    let valid = semi == 0 || src.role() != dst.role();
+                    table[src][dst][semi] = match (stride, valid) {
+                        (Some(stride), true) => color + role + stride * indices[64],
+                        _ => Self::SENTINEL,
+                    };
+                }
+            }
+        }
+
+        table
+    };
 
     /// The total number of different threat features.
     pub const LEN: usize = 2 * Self::THREAT_FEATURES as usize;
@@ -232,103 +319,17 @@ impl TIFeature {
         let src = src.perspective(side);
         let dst = dst.perspective(side);
 
-        let idx = match src.role() {
-            Role::Pawn => Self::pawn_threat_idx(src, wc, dst, wt),
-            Role::Knight => Self::knight_threat_idx(src, wc, dst, wt),
-            Role::Bishop => Self::bishop_threat_idx(src, wc, dst, wt),
-            Role::Rook => Self::rook_threat_idx(src, wc, dst, wt),
-            Role::Queen => Self::queen_threat_idx(src, wc, dst, wt),
-            Role::King => None,
-        }?;
+        let attacks = src.attacks(wc) & ones::<u64>(wt.cast());
+        let idx = Self::BASE[src][dst][usize::from(wt > wc)]
+            + Self::OFFSET[src][wc]
+            + attacks.len().cast::<u16>();
 
-        Some(Num::new(
-            idx + src.color().cast::<u16>() * Self::THREAT_FEATURES,
-        ))
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn pawn_threat_idx(src: Piece, wc: Square, dst: Piece, wt: Square) -> Option<u16> {
-        let stride = Self::stride(src, dst)?;
-        let rank = wc.rank().cast::<u16>() - 1;
-        let file = wc.file().cast::<u16>();
-        let leftward = wt.file() < wc.file();
-        let attack = 2 * file - u16::from(leftward);
-        Some(stride * Self::PAWN_INDEX + rank * 14 + attack)
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn knight_threat_idx(src: Piece, wc: Square, dst: Piece, wt: Square) -> Option<u16> {
-        Self::piece_threat_idx(src, wc, dst, wt, Self::KNIGHT_OFFSET, &Self::KNIGHT_INDICES)
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn bishop_threat_idx(src: Piece, wc: Square, dst: Piece, wt: Square) -> Option<u16> {
-        Self::piece_threat_idx(src, wc, dst, wt, Self::BISHOP_OFFSET, &Self::BISHOP_INDICES)
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn rook_threat_idx(src: Piece, wc: Square, dst: Piece, wt: Square) -> Option<u16> {
-        Self::piece_threat_idx(src, wc, dst, wt, Self::ROOK_OFFSET, &Self::ROOK_INDICES)
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn queen_threat_idx(src: Piece, wc: Square, dst: Piece, wt: Square) -> Option<u16> {
-        Self::piece_threat_idx(src, wc, dst, wt, Self::QUEEN_OFFSET, &Self::QUEEN_INDICES)
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn piece_threat_idx(
-        src: Piece,
-        wc: Square,
-        dst: Piece,
-        wt: Square,
-        offset: u16,
-        indices: &[u16; 65],
-    ) -> Option<u16> {
-        if wt > wc && src.role() == dst.role() {
-            return None;
-        }
-
-        let stride = Self::stride(src, dst)?;
-        let below = src.attacks(wc).bitand(ones::<u64>(wt.cast())).len();
-        Some(offset + stride * indices[64] + indices[wc.cast::<usize>()] + below.cast::<u16>())
-    }
-
-    #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn stride(src: Piece, dst: Piece) -> Option<u16> {
-        const P: [[Option<u16>; 6]; 2] = [
-            [None, Some(0), None, Some(1), None, None],
-            [None, Some(2), None, Some(3), None, None],
-        ];
-
-        const KQ: [[Option<u16>; 6]; 2] = [
-            [Some(0), Some(1), Some(2), Some(3), Some(4), None],
-            [Some(5), Some(6), Some(7), Some(8), Some(9), None],
-        ];
-
-        const BR: [[Option<u16>; 6]; 2] = [
-            [Some(0), Some(1), Some(2), Some(3), None, None],
-            [Some(4), Some(5), Some(6), Some(7), None, None],
-        ];
-
-        match src.role() {
-            Role::Pawn => P[dst.color()][dst.role()],
-            Role::Knight | Role::Queen => KQ[dst.color()][dst.role()],
-            Role::Bishop | Role::Rook => BR[dst.color()][dst.role()],
-            Role::King => None,
-        }
+        idx.convert()
     }
 }
 
 /// A pawn feature with horizontal mirroring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable)]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 #[repr(transparent)]
 pub struct PFeature(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <PFeature as Num>::Repr);
@@ -383,7 +384,7 @@ impl<T> IndexMut<PFeature> for [T; PFeature::LEN] {
 }
 
 /// A pawn-pawn feature with horizontal mirroring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable)]
 #[cfg_attr(test, derive(test_strategy::Arbitrary))]
 #[repr(transparent)]
 pub struct PPFeature(#[cfg_attr(test, strategy(Self::MIN..=Self::MAX))] <PPFeature as Num>::Repr);
