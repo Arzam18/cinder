@@ -154,21 +154,24 @@ impl Moves {
 
     /// Pushes a move into the collection.
     #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn push(&mut self, m: Move) {
         self.0.push(m);
     }
 
+    /// Retains only the elements specified by the predicate.
+    #[inline(always)]
+    pub fn retain<F: FnMut(&Move) -> bool>(&mut self, f: F) {
+        self.0.retain(f);
+    }
+
     /// An iterator over the [`Move`]s in this collection.
     #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn iter(&self) -> <&Self as IntoIterator>::IntoIter {
         self.into_iter()
     }
 
     /// A mutable iterator over the [`Move`]s in this collection.
     #[inline(always)]
-    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn iter_mut(&mut self) -> <&mut Self as IntoIterator>::IntoIter {
         self.into_iter()
     }
@@ -226,17 +229,18 @@ impl RatedMoves {
         SortedRatedMovesIter::new(self)
     }
 
-    /// Re-rates all [`Move`]s in this collection.
+    /// The [`Move`]s in this collection.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    pub fn rate<F: FnMut(Move) -> Rating>(&mut self, f: F) {
-        self.rate_with_head(None, f);
+    pub fn moves_mut(&mut self) -> &mut Moves {
+        self.unsorted = 0;
+        &mut self.moves
     }
 
-    /// Re-rates all [`Move`]s in this collection, promoting `head` to the front.
+    /// Promotes `head` to the front and returns the [`Move`]s and [`Rating`] slots to fill.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    pub fn rate_with_head<F: FnMut(Move) -> Rating>(&mut self, head: Option<Move>, mut f: F) {
+    pub fn unrated_with_head(&mut self, head: Option<Move>) -> (&mut [Move], &mut [Rating]) {
         self.unsorted = 0;
 
         if let Some(i) = head.and_then(|h| self.moves.iter().position(|&m| m == h)) {
@@ -246,9 +250,7 @@ impl RatedMoves {
         }
 
         let start = self.unsorted.cast::<usize>();
-        for (m, rating) in self.moves[start..].iter().zip(&mut self.ratings[start..]) {
-            *rating = f(*m);
-        }
+        (&mut self.moves[start..], &mut self.ratings[start..])
     }
 }
 
@@ -651,20 +653,5 @@ mod tests {
         rms.reverse();
 
         assert_eq!(Vec::from_iter(ms.sorted()), rms);
-    }
-
-    #[proptest]
-    fn rate_defines_move_order(mut ms: RatedMoves) {
-        let mut rating = Rating::new(0);
-
-        ms.rate(|_| {
-            rating += 1;
-            rating
-        });
-
-        let mut ns = Vec::from_iter(ms.clone());
-        ns.reverse();
-
-        assert_eq!(Vec::from_iter(ms.sorted()), ns);
     }
 }

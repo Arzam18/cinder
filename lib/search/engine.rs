@@ -1,6 +1,5 @@
-use crate::chess::{Halfmove, Move, Moves, RatedMoves, Role, SortedRatedMovesIter, Zobrists};
 use crate::search::{ControlFlow::*, *};
-use crate::{nnue::Evaluator, params::Params, simd::*, syzygy::Syzygy, util::*};
+use crate::{chess::*, nnue::Evaluator, params::Params, simd::*, syzygy::Syzygy, util::*};
 use bytemuck::{Zeroable, fill_zeroes, zeroed};
 use derive_more::with_trait::{Debug, Deref, DerefMut, Display, Error};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
@@ -43,6 +42,7 @@ struct SharedData {
     vt: ValueTable,
     syzygy: Syzygy,
     overhead: Duration,
+    starting_material: f32,
 }
 
 #[derive(Debug, Zeroable)]
@@ -105,9 +105,9 @@ impl Stack {
         if self.pos.is_check() {
             zeroed()
         } else if ply >= 2 && !self.pos[ply - 2].is_check() {
-            self.value(0).assume() - self.value(2).assume()
+            self.value(0) - self.value(2)
         } else if ply >= 4 && !self.pos[ply - 4].is_check() {
-            self.value(0).assume() - self.value(4).assume()
+            self.value(0) - self.value(4)
         } else {
             zeroed()
         }
@@ -115,30 +115,30 @@ impl Stack {
 
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn value(&self, i: usize) -> Option<Score> {
-        let idx = self.pos.ply().cast::<usize>().checked_sub(i)?;
+    fn value(&self, i: usize) -> Score {
+        let idx = self.pos.ply().cast::<usize>().wrapping_sub(i);
         // IMPORTANT: widen to Score to avoid mate blindness!
-        Some(self.values.get(idx).assume().saturate())
+        self.values.get(idx).assume().saturate()
     }
 
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn zobrists(&self, i: usize) -> Option<&Zobrists> {
-        let idx = self.pos.ply().cast::<usize>().checked_sub(i)?;
-        Some(self.pos[idx].zobrists())
+    fn zobrists(&self, i: usize) -> &Zobrists {
+        let idx = self.pos.ply().cast::<usize>().wrapping_sub(i);
+        self.pos[idx].zobrists()
     }
 
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     fn continuation(&self, i: usize) -> Option<NonNull<PieceToHistory>> {
-        let idx = self.pos.ply().cast::<usize>().checked_sub(i)?;
+        let idx = self.pos.ply().cast::<usize>().wrapping_sub(i);
         *self.continuation.get(idx).assume()
     }
 
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     fn correction(&self, i: usize) -> Option<NonNull<Correction<1>>> {
-        let idx = self.pos.ply().cast::<usize>().checked_sub(i)?;
+        let idx = self.pos.ply().cast::<usize>().wrapping_sub(i);
         *self.correction.get(idx).assume()
     }
 }
@@ -180,25 +180,30 @@ impl MovePicker {
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     fn rate(&mut self, searcher: &Searcher<'_>, head: Option<Move>) {
         let pos = &searcher.stack.pos;
-        let killer = searcher.stack.killers[pos.ply()];
+        let ply = pos.ply().cast();
+        let ctx = PositionContext::new(pos);
+        let killer = searcher.stack.killers[ply];
+        let continuations = Params::move_rating_continuation(..).len().min(ply);
+        let (moves, ratings) = self.assume().unrated_with_head(head);
 
-        self.assume().rate_with_head(head, |m| {
+        for (&m, r) in moves.iter().zip(ratings) {
             let mut rating = 0.0;
-            let history = searcher.local.histories.attacker.get(pos, m);
+
+            let ctx = MoveContext::new(&ctx, pos, m);
+            let history = searcher.local.histories.attacker.get(ctx);
             rating = Params::move_rating_history(0).mul_add(history, rating);
-            let history = searcher.local.histories.defender.get(pos, m);
+            let history = searcher.local.histories.defender.get(ctx);
             rating = Params::move_rating_history(1).mul_add(history, rating);
-            let history = searcher.local.histories.butterfly.get(pos, m);
+            let history = searcher.local.histories.butterfly.get(ctx);
             rating = Params::move_rating_history(2).mul_add(history, rating);
 
             let gives_check = pos.gives_direct_check(m);
             rating = Params::move_rating_gives_check(0).mul_add(gives_check.cast(), rating);
             rating = Params::move_rating_is_killer(0).mul_add(killer.contains(m).cast(), rating);
 
-            if m.is_quiet() {
-                let ply = pos.ply().cast();
-                for i in 0..Params::move_rating_continuation(..).len().min(ply) {
-                    let history = searcher.stack.continuation(i + 1).get(pos, m);
+            if ctx.is_quiet {
+                for i in 0..continuations {
+                    let history = searcher.stack.continuation(i + 1).get(ctx);
                     rating = Params::move_rating_continuation(i).mul_add(history, rating);
                 }
             } else {
@@ -213,8 +218,8 @@ impl MovePicker {
                 }
             }
 
-            rating.saturate()
-        });
+            *r = rating.saturate();
+        }
     }
 
     #[inline(always)]
@@ -227,14 +232,17 @@ impl MovePicker {
             head: Option<Move>,
             all: bool,
         ) -> SortedRatedMovesIter<'a> {
-            let pos = &searcher.stack.pos;
-            let moves = if all || pos.is_check() {
-                pos.moves().into()
-            } else {
-                pos.noisy().into()
-            };
+            *picker = MovePicker::Rated(RatedMoves::default());
 
-            *picker = MovePicker::Rated(moves);
+            let pos = &searcher.stack.pos;
+            if let MovePicker::Rated(rated) = picker {
+                if all || pos.is_check() {
+                    pos.moves_into(Bitboard::full(), rated.moves_mut());
+                } else {
+                    pos.noisy_into(Bitboard::full(), rated.moves_mut());
+                }
+            }
+
             picker.rate(searcher, head);
             picker.assume().sorted()
         }
@@ -290,18 +298,14 @@ impl<'a> Searcher<'a> {
             value
         });
 
-        let piece_values = f32x8::load_or_default(Params::piece_values(..));
-        let starting_material: f32 = f32x8::from_array([16.0, 4.0, 4.0, 4.0, 2.0, 2.0, 0.0, 0.0])
-            .mul(piece_values)
-            .reduce_sum();
-
         let pos = &self.stack.pos;
         let piece_counts = f32x8::from_array(array::from_fn(|i| match i.convert() {
-            Some(r) => pos.by_role(r).count() as f32,
+            Some(r) => pos.by_role(r).count().cast(),
             None => 0.0,
         }));
 
-        let material = piece_counts.mul(piece_values).reduce_sum() / starting_material;
+        let piece_values = f32x8::load_or_default(Params::piece_values(..));
+        let material = piece_counts.mul(piece_values).reduce_sum() / self.shared.starting_material;
 
         let halfmoves = pos.halfmove().cast::<f32>() / Halfmove::MAX.cast::<f32>();
         let mut scale = halfmoves.lerp(*Params::halfmove_scaling(0), *Params::halfmove_scaling(1));
@@ -321,24 +325,29 @@ impl<'a> Searcher<'a> {
             .max(*Params::history_malus(2));
 
         let pos = &self.stack.pos;
-        self.local.histories.attacker.update(pos, best, bonus);
-        self.local.histories.defender.update(pos, best, bonus);
-        self.local.histories.butterfly.update(pos, best, bonus);
+        let ctx = PositionContext::new(pos);
+        let continuations = pos.ply().cast::<usize>().min(2);
 
-        if best.is_quiet() {
-            for i in 0..pos.ply().cast::<usize>().min(2) {
-                self.stack.continuation(i + 1).update(pos, best, bonus);
+        let best_ctx = MoveContext::new(&ctx, pos, best);
+        self.local.histories.attacker.update(best_ctx, bonus);
+        self.local.histories.defender.update(best_ctx, bonus);
+        self.local.histories.butterfly.update(best_ctx, bonus);
+
+        if best_ctx.is_quiet {
+            for i in 0..continuations {
+                self.stack.continuation(i + 1).update(best_ctx, bonus);
             }
         }
 
         for m in moves.iter().take_while(|m| **m != best) {
-            self.local.histories.attacker.update(pos, *m, malus);
-            self.local.histories.defender.update(pos, *m, malus);
-            self.local.histories.butterfly.update(pos, *m, malus);
+            let ctx = MoveContext::new(&ctx, pos, *m);
+            self.local.histories.attacker.update(ctx, malus);
+            self.local.histories.defender.update(ctx, malus);
+            self.local.histories.butterfly.update(ctx, malus);
 
-            if best.is_quiet() && m.is_quiet() {
-                for i in 0..pos.ply().cast::<usize>().min(2) {
-                    self.stack.continuation(i + 1).update(pos, *m, malus);
+            if best_ctx.is_quiet && ctx.is_quiet {
+                for i in 0..continuations {
+                    self.stack.continuation(i + 1).update(ctx, malus);
                 }
             }
         }
@@ -349,7 +358,7 @@ impl<'a> Searcher<'a> {
     fn update_correction(&mut self, depth: f32, score: ScoreBound) {
         let pos = &self.stack.pos;
         let (ply, zbs) = (pos.ply(), pos.zobrists());
-        let diff = score.bound(ply) - self.stack.value(0).assume();
+        let diff = score.bound(ply) - self.stack.value(0);
         let error = depth * diff.cast::<f32>();
 
         let gradient = error
@@ -358,19 +367,26 @@ impl<'a> Searcher<'a> {
             .min(*Params::correction_gradient(2));
 
         let corrections = &mut self.local.corrections;
-        corrections.pawns.update(pos, zbs.pawns, gradient);
-        corrections.minor.update(pos, zbs.minor, gradient);
-        corrections.major.update(pos, zbs.major, gradient);
-        corrections.white.update(pos, zbs.white, gradient);
-        corrections.black.update(pos, zbs.black, gradient);
+        let ctx = CorrectionContext::new(pos, zbs.pawns);
+        corrections.pawns.update(ctx, gradient);
+        let ctx = CorrectionContext::new(pos, zbs.minor);
+        corrections.minor.update(ctx, gradient);
+        let ctx = CorrectionContext::new(pos, zbs.major);
+        corrections.major.update(ctx, gradient);
+        let ctx = CorrectionContext::new(pos, zbs.white);
+        corrections.white.update(ctx, gradient);
+        let ctx = CorrectionContext::new(pos, zbs.black);
+        corrections.black.update(ctx, gradient);
 
         for i in 0..ply.cast::<usize>().min(2) {
-            let key = self.stack.zobrists(i + 1).assume().hash ^ zbs.hash;
-            corrections.history.update(pos, key, gradient);
+            let key = self.stack.zobrists(i + 1).hash ^ zbs.hash;
+            let ctx = CorrectionContext::new(pos, key);
+            corrections.history.update(ctx, gradient);
         }
 
         for i in 0..ply.cast::<usize>().min(2) {
-            self.stack.correction(i + 1).update(pos, (), gradient);
+            let ctx = CorrectionContext::new(pos, ());
+            self.stack.correction(i + 1).update(ctx, gradient);
         }
     }
 
@@ -381,25 +397,32 @@ impl<'a> Searcher<'a> {
         let (ply, zbs) = (pos.ply(), pos.zobrists());
 
         let mut correction = 0.0;
-        let pawns = self.local.corrections.pawns.get(pos, zbs.pawns);
-        correction = Params::pawns_correction(0).mul_add(pawns, correction);
-        let minor = self.local.corrections.minor.get(pos, zbs.minor);
-        correction = Params::minor_correction(0).mul_add(minor, correction);
-        let major = self.local.corrections.major.get(pos, zbs.major);
-        correction = Params::major_correction(0).mul_add(major, correction);
-        let white = self.local.corrections.white.get(pos, zbs.white);
-        correction = Params::pieces_correction(0).mul_add(white, correction);
-        let black = self.local.corrections.black.get(pos, zbs.black);
-        correction = Params::pieces_correction(0).mul_add(black, correction);
+        let ctx = CorrectionContext::new(pos, zbs.pawns);
+        let history = self.local.corrections.pawns.get(ctx);
+        correction = Params::pawns_correction(0).mul_add(history, correction);
+        let ctx = CorrectionContext::new(pos, zbs.minor);
+        let history = self.local.corrections.minor.get(ctx);
+        correction = Params::minor_correction(0).mul_add(history, correction);
+        let ctx = CorrectionContext::new(pos, zbs.major);
+        let history = self.local.corrections.major.get(ctx);
+        correction = Params::major_correction(0).mul_add(history, correction);
+        let ctx = CorrectionContext::new(pos, zbs.white);
+        let history = self.local.corrections.white.get(ctx);
+        correction = Params::pieces_correction(0).mul_add(history, correction);
+        let ctx = CorrectionContext::new(pos, zbs.black);
+        let history = self.local.corrections.black.get(ctx);
+        correction = Params::pieces_correction(0).mul_add(history, correction);
 
         for i in 0..Params::history_correction(..).len().min(ply.cast()) {
-            let key = self.stack.zobrists(i + 1).assume().hash ^ zbs.hash;
-            let history = self.local.corrections.history.get(pos, key);
+            let key = self.stack.zobrists(i + 1).hash ^ zbs.hash;
+            let ctx = CorrectionContext::new(pos, key);
+            let history = self.local.corrections.history.get(ctx);
             correction = Params::history_correction(i).mul_add(history, correction);
         }
 
         for i in 0..Params::continuation_correction(..).len().min(ply.cast()) {
-            let history = self.stack.correction(i + 1).get(pos, ());
+            let ctx = CorrectionContext::new(pos, ());
+            let history = self.stack.correction(i + 1).get(ctx);
             correction = Params::continuation_correction(i).mul_add(history, correction);
         }
 
@@ -558,8 +581,8 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        let value = self.stack.value(0);
         let is_check = self.stack.pos.is_check();
-        let value = self.stack.value(0).assume();
         let stand_pat = match transposition {
             _ if is_check => Score::lower(),
             Some(t) if t.score.bound(ply).is_decisive() => value,
@@ -692,8 +715,8 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        let value = self.stack.value(0);
         let is_check = self.stack.pos.is_check();
-        let value = self.stack.value(0).assume();
         let stand_pat = match transposition {
             _ if is_check => Score::lower(),
             Some(t) if !t.score.range(ply).contains(&value) => t.score.bound(ply),
@@ -981,8 +1004,12 @@ impl<'a> Searcher<'a> {
                 }
             }
 
-            let butterfly = self.local.histories.butterfly.get(pos, m);
-            let counter = self.stack.continuation(1).filter(|_| is_quiet).get(pos, m);
+            let ctx = MoveContext::new(&PositionContext::new(pos), pos, m);
+            let butterfly = self.local.histories.butterfly.get(ctx);
+            let counter = match pos.ply().get() {
+                1.. => self.stack.continuation(1).filter(|_| is_quiet).get(ctx),
+                ..1 => 0.0,
+            };
 
             let mut next = self.next(Some(m));
             let gives_check = next.stack.pos.is_check();
@@ -1088,7 +1115,8 @@ impl<'a> Searcher<'a> {
             };
 
             let pos = &self.stack.pos;
-            let butterfly = self.local.histories.butterfly.get(pos, m);
+            let ctx = MoveContext::new(&PositionContext::new(pos), pos, m);
+            let butterfly = self.local.histories.butterfly.get(ctx);
             self.stack.attention = self.ctrl.attention(m);
 
             let mut next = self.next(Some(m));
@@ -1136,7 +1164,7 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        let value = self.stack.value(0).assume();
+        let value = self.stack.value(0);
         if !is_check && head.is_quiet() && !score.range(zeroed()).contains(&value) {
             self.update_correction(depth, score);
         }
@@ -1253,22 +1281,24 @@ impl<'e, 'p> Search<'e, 'p> {
     /// Moves to search.
     #[inline(always)]
     fn moves_to_search(&self) -> Moves {
-        let Some(dtz) = self.engine.shared.syzygy.dtz(self.pos) else {
-            return self.pos.moves();
-        };
+        let mut moves = Moves::default();
+        self.pos.moves_into(Bitboard::full(), &mut moves);
+        if let Some(dtz) = self.engine.shared.syzygy.dtz(self.pos) {
+            moves.retain(|m| {
+                let mut next = **self.pos;
+                next.play(*m);
 
-        Moves::from_iter(self.pos.moves().into_iter().filter(|m| {
-            let mut next = **self.pos;
-            next.play(*m);
+                if dtz > 0 && next.is_checkmate() {
+                    true // handles special case of mate near the 50th move horizon
+                } else if let Some(wdl) = self.engine.shared.syzygy.wdl(&next) {
+                    -wdl >= dtz.into()
+                } else {
+                    true // safety net for runtime errors
+                }
+            });
+        }
 
-            if dtz > 0 && next.is_checkmate() {
-                true // handles special case of mate near the 50th move horizon
-            } else if let Some(wdl) = self.engine.shared.syzygy.wdl(&next) {
-                -wdl >= dtz.into()
-            } else {
-                true // safety net for runtime errors
-            }
-        }))
+        moves
     }
 
     /// Aborts the search.
@@ -1311,10 +1341,10 @@ impl Stream for Search<'_, '_> {
     type Item = Info;
 
     #[inline(always)]
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
         if let Some(rx) = &mut this.channel {
-            let info = match rx.poll_next_unpin(cx) {
+            let info = match rx.poll_next_unpin(ctx) {
                 Poll::Ready(Some(info)) => info,
                 poll => return poll,
             };
@@ -1325,7 +1355,7 @@ impl Stream for Search<'_, '_> {
 
         #[inline(never)]
         #[expect(clippy::deref_addrof)]
-        fn bootstrap(search: &mut Search<'_, '_>, cx: &mut Context<'_>) -> Poll<Option<Info>> {
+        fn bootstrap(search: &mut Search<'_, '_>, ctx: &mut Context<'_>) -> Poll<Option<Info>> {
             let (tx, rx) = unbounded();
             search.channel = Some(rx);
 
@@ -1372,10 +1402,10 @@ impl Stream for Search<'_, '_> {
                 }
             }));
 
-            unsafe { Pin::new_unchecked(search).poll_next(cx) }
+            unsafe { Pin::new_unchecked(search).poll_next(ctx) }
         }
 
-        bootstrap(this, cx)
+        bootstrap(this, ctx)
     }
 }
 
@@ -1421,6 +1451,9 @@ impl Engine {
                 vt: ValueTable::new(options.hash),
                 syzygy: Syzygy::new(&options.syzygy),
                 overhead: options.overhead.into(),
+                starting_material: f32x8::load_or_default(Params::piece_values(..))
+                    .mul(f32x8::from_array([16.0, 4.0, 4.0, 4.0, 2.0, 2.0, 0.0, 0.0]))
+                    .reduce_sum(),
             },
         }
     }
@@ -1565,7 +1598,6 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chess::{Outcome, Position};
     use std::{fmt::Debug, thread};
     use test_strategy::proptest;
 
