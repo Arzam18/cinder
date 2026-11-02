@@ -1,5 +1,5 @@
-use crate::chess::{Bitboard, File, Flip, Transpose};
-use crate::util::{Assume, Int, Niched, Num};
+use crate::chess::{Bitboard, Color, File, Flip, Perspective, Transpose};
+use crate::util::{Int, Niched, Num};
 use derive_more::with_trait::{Display, Error};
 use std::fmt::{self, Formatter, Write};
 use std::ops::{Index, IndexMut};
@@ -52,6 +52,16 @@ const impl Flip for Rank {
     }
 }
 
+const impl Perspective<Color> for Rank {
+    #[inline(always)]
+    fn perspective(self, side: Color) -> Self {
+        match side {
+            Color::White => self,
+            Color::Black => self.flip(),
+        }
+    }
+}
+
 const impl Transpose for Rank {
     type Transposition = File;
 
@@ -76,14 +86,14 @@ const impl<T> Index<Rank> for [T; Rank::LEN] {
 
     #[inline(always)]
     fn index(&self, r: Rank) -> &Self::Output {
-        self.get(r.cast::<usize>()).assume()
+        unsafe { self.get_unchecked(r.cast::<usize>()) }
     }
 }
 
 const impl<T> IndexMut<Rank> for [T; Rank::LEN] {
     #[inline(always)]
     fn index_mut(&mut self, r: Rank) -> &mut Self::Output {
-        self.get_mut(r.cast::<usize>()).assume()
+        unsafe { self.get_unchecked_mut(r.cast::<usize>()) }
     }
 }
 

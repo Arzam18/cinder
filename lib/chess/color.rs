@@ -1,4 +1,4 @@
-use crate::chess::Flip;
+use crate::chess::{Flip, Perspective};
 use crate::util::{Assume, Binary, Bits, Int, Niched, Num};
 use derive_more::with_trait::Display;
 use std::ops::{Index, IndexMut, Not};
@@ -36,6 +36,13 @@ const impl Flip for Color {
     #[inline(always)]
     fn flip(self) -> Self {
         self.not()
+    }
+}
+
+const impl Perspective<Color> for Color {
+    #[inline(always)]
+    fn perspective(self, side: Color) -> Self {
+        Num::new(self.get() ^ side.get())
     }
 }
 
@@ -84,14 +91,14 @@ const impl<T> Index<Color> for [T; Color::LEN] {
 
     #[inline(always)]
     fn index(&self, c: Color) -> &Self::Output {
-        self.get(c.cast::<usize>()).assume()
+        unsafe { self.get_unchecked(c.cast::<usize>()) }
     }
 }
 
 const impl<T> IndexMut<Color> for [T; Color::LEN] {
     #[inline(always)]
     fn index_mut(&mut self, c: Color) -> &mut Self::Output {
-        self.get_mut(c.cast::<usize>()).assume()
+        unsafe { self.get_unchecked_mut(c.cast::<usize>()) }
     }
 }
 

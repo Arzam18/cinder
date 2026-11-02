@@ -1,5 +1,5 @@
 use crate::simd::*;
-use crate::util::{Assume, Binary, Bits, Int, Num};
+use crate::util::{Binary, Bits, Int, Num};
 use bytemuck::{NoUninit, Pod, Zeroable, zeroed};
 use derive_more::with_trait::{Debug, Deref, Display, IntoIterator};
 use std::{iter::FusedIterator, ops::*};
@@ -50,14 +50,14 @@ const impl<T> Index<Idx> for [T; Idx::LEN] {
 
     #[inline(always)]
     fn index(&self, idx: Idx) -> &Self::Output {
-        self.get(idx.cast::<usize>()).assume()
+        unsafe { self.get_unchecked(idx.cast::<usize>()) }
     }
 }
 
 const impl<T> IndexMut<Idx> for [T; Idx::LEN] {
     #[inline(always)]
     fn index_mut(&mut self, idx: Idx) -> &mut Self::Output {
-        self.get_mut(idx.cast::<usize>()).assume()
+        unsafe { self.get_unchecked_mut(idx.cast::<usize>()) }
     }
 }
 
@@ -82,7 +82,13 @@ const impl IdxSet {
     /// An empty set of [`Place`]s.
     #[inline(always)]
     pub fn empty() -> Self {
-        zeroed()
+        Self::lower()
+    }
+
+    /// A full set of [`Place`]s.
+    #[inline(always)]
+    pub fn full() -> Self {
+        Self::upper()
     }
 
     /// The number of [`Place`]s in the set.
@@ -370,7 +376,7 @@ const impl Iterator for Indices {
             None
         } else {
             let idx = Idx::new(self.0.trailing_zeros().cast());
-            self.0 ^= idx.to_set();
+            self.0 &= self.0.get() - 1;
             Some(idx)
         }
     }

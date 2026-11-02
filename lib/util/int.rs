@@ -1,4 +1,4 @@
-use crate::util::{Assume, Num, NumRepr};
+use crate::util::{Num, NumRepr};
 use bytemuck::zeroed;
 use std::{cmp::Ordering, hint::unreachable_unchecked, iter::FusedIterator, mem::transmute_copy};
 use std::{num::*, ops::*};
@@ -45,16 +45,22 @@ const impl<I: [const] Int<Repr: [const] IntRepr>> Ints<I> {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        if self.is_empty() {
-            0
-        } else {
+        if I::MAX < <I::Repr as Num>::MAX {
             (self.end.cast::<isize>() - self.start.cast::<isize>() + 1).cast()
+        } else {
+            let len = (self.end.cast::<isize>() - self.start.cast::<isize>() + 1).cast::<usize>();
+            let mask = (self.is_empty as usize).wrapping_neg();
+            len & !mask
         }
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.is_empty
+        if I::MAX < <I::Repr as Num>::MAX {
+            self.start > self.end
+        } else {
+            self.is_empty
+        }
     }
 }
 
@@ -63,14 +69,15 @@ const impl<I: [const] Int<Repr: [const] IntRepr>> Iterator for Ints<I> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.is_empty {
+        if self.is_empty() {
             None
         } else {
             let next = I::new(self.start);
-            if self.start == self.end {
-                self.is_empty = true;
-            } else {
+
+            if I::MAX < <I::Repr as Num>::MAX || self.start != self.end {
                 self.start += ones::<u8>(1).cast();
+            } else {
+                self.is_empty = true;
             }
 
             Some(next)
@@ -87,14 +94,17 @@ const impl<I: [const] Int<Repr: [const] IntRepr>> Iterator for Ints<I> {
 const impl<I: [const] Int<Repr: [const] IntRepr>> DoubleEndedIterator for Ints<I> {
     #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.is_empty {
+        if self.is_empty() {
             None
         } else {
             let next = I::new(self.end);
-            if self.start == self.end {
-                self.is_empty = true;
-            } else {
+
+            if self.start != self.end {
                 self.end -= ones::<u8>(1).cast();
+            } else if I::MAX < <I::Repr as Num>::MAX {
+                self.start += ones::<u8>(1).cast();
+            } else {
+                self.is_empty = true;
             }
 
             Some(next)
@@ -226,8 +236,8 @@ macro_rules! impl_num_for {
 
             #[inline(always)]
             fn clip(self, min: Self, max: Self) -> Self {
-                (min <= max).assume();
-                Ord::clamp(self, min, max)
+                debug_assert!(min <= max);
+                self.max(min).min(max)
             }
 
             #[inline(always)]
@@ -268,9 +278,17 @@ macro_rules! impl_num_for {
 
             #[inline(always)]
             fn saturate<N: [const] Num<Repr: [const] NumRepr>>(self) -> N {
-                let min = N::MIN.convert().unwrap_or(Self::MIN);
-                let max = N::MAX.convert().unwrap_or(Self::MAX);
-                N::new(self.clip(min, max).cast::<N::Repr>())
+                let min = N::MIN.cast::<Self>();
+                let max = N::MAX.cast::<Self>();
+
+                if min <= max && min.cast::<N::Repr>() == N::MIN && max.cast::<N::Repr>() == N::MAX
+                {
+                    N::new(self.clip(min, max).cast())
+                } else {
+                    let min = N::MIN.convert().unwrap_or(Self::MIN);
+                    let max = N::MAX.convert().unwrap_or(Self::MAX);
+                    N::new(self.clip(min, max).cast())
+                }
             }
         }
     };

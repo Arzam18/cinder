@@ -1,4 +1,4 @@
-use crate::chess::{Butterfly, File, Flip, Rank, Square, Transpose};
+use crate::chess::{Butterfly, Color, File, Flip, Perspective, Rank, Square, Transpose};
 use crate::simd::*;
 use crate::util::{Int, Num};
 use bytemuck::{Pod, Zeroable, zeroed};
@@ -22,34 +22,34 @@ const unsafe impl Num for Bitboard {
 const unsafe impl Int for Bitboard {}
 
 const impl Bitboard {
-    /// An empty board.
+    /// An empty set of [`Square`]s.
     #[inline(always)]
     pub fn empty() -> Self {
-        zeroed()
+        Self::lower()
     }
 
-    /// A full board.
+    /// A full set of [`Square`]s.
     #[inline(always)]
     pub fn full() -> Self {
-        Bitboard::new(0xFFFFFFFFFFFFFFFF)
+        Self::upper()
     }
 
     /// Border squares.
     #[inline(always)]
     pub fn border() -> Self {
-        Bitboard::new(0xFF818181818181FF)
+        Self::new(0xFF818181818181FF)
     }
 
     /// Light squares.
     #[inline(always)]
     pub fn light() -> Self {
-        Bitboard::new(0x55AA55AA55AA55AA)
+        Self::new(0x55AA55AA55AA55AA)
     }
 
     /// Dark squares.
     #[inline(always)]
     pub fn dark() -> Self {
-        Bitboard::new(0xAA55AA55AA55AA55)
+        Self::new(0xAA55AA55AA55AA55)
     }
 
     /// Fills out squares on a bitboard.
@@ -475,6 +475,16 @@ const impl Flip for Bitboard {
     }
 }
 
+const impl Perspective<Color> for Bitboard {
+    #[inline(always)]
+    fn perspective(self, side: Color) -> Self {
+        match side {
+            Color::White => self,
+            Color::Black => self.flip(),
+        }
+    }
+}
+
 const impl Transpose for Bitboard {
     type Transposition = Self;
 
@@ -572,7 +582,7 @@ const impl Iterator for Squares {
             None
         } else {
             let sq = <Square as Num>::new(self.0.trailing_zeros().cast());
-            self.0 ^= sq.bitboard();
+            self.0 &= self.0.get() - 1;
             Some(sq)
         }
     }

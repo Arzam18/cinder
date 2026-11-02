@@ -195,32 +195,25 @@ impl Board {
         self.squares[side][Idx::KING]
     }
 
-    /// Squares giving direct check to the king of a [`Color`].
+    /// Squares giving direct check to the opposing king.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn direct_checks(&self) -> [Bitboard; 4] {
-        let them = !self.turn;
-        let rays = self.king(them).assume().rays();
-        let furled = self.furl(rays);
-        let mask = furled.visible();
+        let ksq = self.king(!self.turn).assume();
+        self.direct_checks_to(ksq)
+    }
 
-        use Role::*;
-        let pawn_attacks = mask & furled.attacks(Piece::new(Pawn, them));
-        let knight_attacks = mask & furled.attacks(Piece::new(Knight, them));
-        let bishop_attacks = mask & furled.attacks(Piece::new(Bishop, them));
-        let rook_attacks = mask & furled.attacks(Piece::new(Rook, them));
+    /// Squares giving direct check to the king on a square.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn direct_checks_to(&self, ksq: Square) -> [Bitboard; 4] {
+        let them = !self.turn;
+        let unfurled = self.furl(ksq.rays()).checker_roles(them).unfurl(ksq.rays());
 
         let pawn = u8x64::splat(0b0001);
         let knight = u8x64::splat(0b0010);
         let bishop = u8x64::splat(0b0100);
         let rook = u8x64::splat(0b1000);
-
-        let packed = pawn_attacks.select(pawn, zeroed())
-            | knight_attacks.select(knight, zeroed())
-            | bishop_attacks.select(bishop, zeroed())
-            | rook_attacks.select(rook, zeroed());
-
-        let unfurled = packed.unfurl(rays);
 
         [
             unfurled.bitand(pawn).simd_ne(zeroed()).into(),
@@ -233,8 +226,15 @@ impl Board {
     /// Computes [`Pins`].
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    pub fn pins(&self, threats: &Threats) -> Pins {
-        Pins::new(self, threats)
+    pub fn pins(&self) -> Pins {
+        Pins::new(self, self.king(self.turn).assume())
+    }
+
+    /// Computes [`Pins`] to a king on a square.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn pins_to(&self, ksq: Square) -> Pins {
+        Pins::new(self, ksq)
     }
 
     /// Computes [`Threats`] .

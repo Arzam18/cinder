@@ -1,5 +1,5 @@
 use crate::chess::*;
-use crate::util::{Assume, Binary, Bits, Int, Niched, Num};
+use crate::util::{Binary, Bits, Int, Niched, Num};
 use derive_more::with_trait::{Display, Error, From};
 use std::fmt::{self, Formatter};
 use std::ops::{Add, AddAssign, Index, IndexMut, Sub, SubAssign};
@@ -77,11 +77,25 @@ const impl Mirror for Square {
     }
 }
 
+const impl Perspective<Side> for Square {
+    #[inline(always)]
+    fn perspective(self, side: Side) -> Self {
+        Num::new(self.get() ^ (side.cast::<i8>() * Square::H1.get()))
+    }
+}
+
 const impl Flip for Square {
     /// Flips this square's [`Rank`].
     #[inline(always)]
     fn flip(self) -> Self {
         Num::new(self.get() ^ Square::A8.get())
+    }
+}
+
+const impl Perspective<Color> for Square {
+    #[inline(always)]
+    fn perspective(self, side: Color) -> Self {
+        Num::new(self.get() ^ (side.cast::<i8>() * Square::A8.get()))
     }
 }
 
@@ -155,14 +169,14 @@ const impl<T> Index<Square> for [T; Square::LEN] {
 
     #[inline(always)]
     fn index(&self, sq: Square) -> &Self::Output {
-        self.get(sq.cast::<usize>()).assume()
+        unsafe { self.get_unchecked(sq.cast::<usize>()) }
     }
 }
 
 const impl<T> IndexMut<Square> for [T; Square::LEN] {
     #[inline(always)]
     fn index_mut(&mut self, sq: Square) -> &mut Self::Output {
-        self.get_mut(sq.cast::<usize>()).assume()
+        unsafe { self.get_unchecked_mut(sq.cast::<usize>()) }
     }
 }
 

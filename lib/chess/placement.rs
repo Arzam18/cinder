@@ -59,38 +59,70 @@ const impl Place {
 
     #[inline(always)]
     pub fn idx(self) -> Option<Idx> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(Idx::decode(Num::new(self.0.slice(..4).cast())))
-        }
+        const INDICES: [Option<Idx>; 256] = const {
+            let mut table = [None; 256];
+
+            for piece in Piece::iter() {
+                for idx in Idx::iter() {
+                    table[Place::new(piece, idx).cast::<usize>()] = Some(idx);
+                }
+            }
+
+            table
+        };
+
+        INDICES[self.cast::<usize>()]
     }
 
     #[inline(always)]
     pub fn piece(self) -> Option<Piece> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(Piece::decode(Num::new(self.0.slice(4..).cast())))
-        }
+        const PIECES: [Option<Piece>; 256] = const {
+            let mut table = [None; 256];
+
+            for piece in Piece::iter() {
+                for idx in Idx::iter() {
+                    table[Place::new(piece, idx).cast::<usize>()] = Some(piece);
+                }
+            }
+
+            table
+        };
+
+        PIECES[self.cast::<usize>()]
     }
 
     #[inline(always)]
     pub fn color(self) -> Option<Color> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(Color::decode(Num::new(self.0.slice(7..).get())))
-        }
+        const COLORS: [Option<Color>; 256] = const {
+            let mut table = [None; 256];
+
+            for p in Piece::iter() {
+                for idx in Idx::iter() {
+                    table[Place::new(p, idx).cast::<usize>()] = Some(p.color());
+                }
+            }
+
+            table
+        };
+
+        COLORS[self.cast::<usize>()]
     }
 
     #[inline(always)]
     pub fn role(self) -> Option<Role> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(Role::decode(Num::new(self.0.slice(4..=6).get())))
-        }
+        const ROLES: [Option<Role>; 256] = const {
+            let mut table = [None; 256];
+
+            for p in Piece::iter() {
+                for idx in Idx::iter() {
+                    table[Place::new(p, idx).cast::<usize>()] = Some(p.role());
+                }
+            }
+
+            table
+        };
+
+        ROLES[self.cast::<usize>()]
     }
 }
 
@@ -246,8 +278,8 @@ impl Placement {
 
         #[cfg(target_feature = "avx512f")]
         {
-            let ones = self.occupied().select(Simd::splat(1), Simd::splat(0));
-            Wordboard::from_simd(ones.shlv(indices.cast::<u16>()))
+            let ones = u16x64::splat(1);
+            Wordboard::from_simd(ones.shlv(indices.cast::<u16>())).mask(self.occupied())
         }
 
         #[cfg(not(target_feature = "avx512f"))]
@@ -362,6 +394,53 @@ impl FurledPlacement {
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     pub fn blend<I: MaskElement>(&self, mask: M<I, 64>, place: Place) -> Self {
         Self(self.0.blend(mask, place))
+    }
+
+    /// Role bits of the pieces that can give check from each visible square.
+    #[inline(always)]
+    #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
+    pub fn checker_roles(&self, color: Color) -> u8x64 {
+        const ROLES: [u8x64; Color::LEN] = const {
+            let mut roles = [u8x64::splat(0); Color::LEN];
+
+            for color in Color::iter() {
+                let pawn = match color {
+                    Color::White => WPAWN,
+                    Color::Black => BPAWN,
+                };
+
+                let mut lanes = [0; Square::LEN];
+
+                for sq in Square::iter() {
+                    let attackers = ATTACKERS.as_array()[sq];
+                    let mut bits = 0;
+
+                    if attackers & pawn != 0 {
+                        bits |= 0b0001;
+                    }
+
+                    if attackers & KNIGHT != 0 {
+                        bits |= 0b0010;
+                    }
+
+                    if attackers & BISHOP != 0 {
+                        bits |= 0b0100;
+                    }
+
+                    if attackers & ROOK != 0 {
+                        bits |= 0b1000;
+                    }
+
+                    lanes[sq] = bits;
+                }
+
+                roles[color] = u8x64::from_array(lanes);
+            }
+
+            roles
+        };
+
+        ROLES[color] & self.visible().to_simd().cast::<u8>()
     }
 
     /// Visible [`Place`]s along [`Rays`].
