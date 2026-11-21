@@ -75,11 +75,13 @@ struct Stack {
     pv: Pv,
     pos: Evaluator,
     nmr_min_ply: Ply,
+    nmr_prior: [u32; Ply::LEN],
     attention: Option<NonNull<Nodes>>,
     continuation: [Option<NonNull<PieceToHistory>>; Ply::LEN],
     correction: [Option<NonNull<Correction<1>>>; Ply::LEN],
     killers: [Killers; Ply::LEN],
     values: [Value; Ply::LEN],
+    cuts: [u32; Ply::LEN],
 }
 
 impl Stack {
@@ -89,11 +91,13 @@ impl Stack {
             pv,
             pos,
             nmr_min_ply: zeroed(),
+            nmr_prior: zeroed(),
             attention: zeroed(),
             continuation: zeroed(),
             correction: zeroed(),
             killers: zeroed(),
             values: zeroed(),
+            cuts: zeroed(),
         }
     }
 
@@ -471,11 +475,14 @@ impl<'a> Searcher<'a> {
     /// Computes the late move reduction.
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
-    fn lmr(depth: f32, index: usize) -> f32 {
+    fn lmr(depth: f32, index: f32) -> f32 {
+        let depth = if depth > 0.0 { depth.ln() } else { 0.0 };
+        let index = if index > 0.0 { index.ln() } else { 0.0 };
+
         convolve([
             (1.0, Params::lmr_scalar(..)),
-            (index.max(1).cast::<f32>().ln(), Params::lmr_index(..)),
-            (depth.ln(), Params::lmr_depth(..)),
+            (index, Params::lmr_index(..)),
+            (depth, Params::lmr_depth(..)),
         ])
     }
 
@@ -483,16 +490,16 @@ impl<'a> Searcher<'a> {
     #[inline(always)]
     #[cfg_attr(feature = "no_panic", no_panic::no_panic)]
     fn next(&mut self, m: Option<Move>) -> RecursionGuard<'_, 'a> {
-        let idx = self.stack.pos.ply().cast::<usize>();
+        let ply = self.stack.pos.ply();
 
-        self.stack.continuation[idx] = match m {
+        self.stack.continuation[ply] = match m {
             None => None,
             Some(m) => Some(NonNull::from_mut(
                 self.local.histories.continuation.get(&self.stack.pos, m),
             )),
         };
 
-        self.stack.correction[idx] = match m {
+        self.stack.correction[ply] = match m {
             None => None,
             Some(m) => Some(NonNull::from_mut(
                 self.local.corrections.continuation.get(&self.stack.pos, m),
@@ -729,6 +736,9 @@ impl<'a> Searcher<'a> {
             };
         }
 
+        self.stack.nmr_prior[ply + 1] = 0;
+        self.stack.cuts[ply + 2] = 0;
+
         let is_all = !IS_PV && !is_cut;
         let was_pv = transposition.is_some_and(|t| t.was_pv);
         let (lower, upper) = match self.shared.syzygy.wdl_after_zeroing(&self.stack.pos) {
@@ -791,30 +801,41 @@ impl<'a> Searcher<'a> {
             }
 
             if let Some(t) = transposition {
-                if !beta.is_losing() && !stand_pat.is_winning() {
+                if !beta.is_losing() && !stand_pat.is_winning() && is_cut {
                     if depth < t.depth.cast::<f32>() + Params::fhp_depth_limit(0) {
                         let margin = convolve([
                             (1.0, Params::fhp_margin_scalar(..)),
                             (depth - t.depth.cast::<f32>(), Params::fhp_margin_depth(..)),
                         ]);
 
-                        if is_cut && t.score.lower(ply) - margin.cast::<i16>() >= beta {
+                        if t.score.lower(ply) - margin.cast::<i16>() >= beta {
                             return Ok(t.transpose(ply).truncate());
                         }
                     }
                 }
             }
 
-            if depth >= *Params::nmr_depth_limit(0) && ply >= self.stack.nmr_min_ply && is_cut {
+            if (!beta.is_losing() && !stand_pat.is_winning() && is_cut)
+                && depth >= *Params::nmr_depth_limit(0)
+                && ply >= self.stack.nmr_min_ply
+            {
                 let turn = self.stack.pos.turn();
                 let ours = self.stack.pos.by_color(turn);
                 let pawns = self.stack.pos.by_role(Role::Pawn);
                 let kings = self.stack.pos.by_role(Role::King);
-                if !beta.is_losing() && !stand_pat.is_winning() && (ours & !(pawns ^ kings)).any() {
+                if (ours & !(pawns ^ kings)).any() {
+                    let gamma = *Params::nmr_prior_model(0);
+                    let delta = *Params::nmr_prior_model(1);
+                    let prior = self.stack.nmr_prior[ply].cast::<f32>();
+                    let prior = prior.mul_add(gamma, delta).sigmoid();
+                    let cuts = self.stack.cuts[ply + 1] < 2;
+
                     let margin = convolve([
                         (1.0, Params::nmr_margin_scalar(..)),
                         (depth, Params::nmr_margin_depth(..)),
                         (is_improving.cast(), Params::nmr_margin_is_improving(..)),
+                        (prior, Params::nmr_margin_prior(..)),
+                        (cuts.cast(), Params::nmr_margin_cuts(..)),
                     ]);
 
                     let margin = margin.max(0.0);
@@ -831,6 +852,7 @@ impl<'a> Searcher<'a> {
                         let pv = -self.next(None).nw(nmr_depth - 1.0, -beta + 1, false)?;
                         if pv >= beta && !pv.is_winning() {
                             if self.stack.nmr_min_ply > 0 || depth < *Params::nmv_depth_limit(0) {
+                                self.stack.nmr_prior[ply] += 1;
                                 return Ok(pv.clip(lower, upper).truncate());
                             }
 
@@ -842,6 +864,7 @@ impl<'a> Searcher<'a> {
                             self.stack.nmr_min_ply = zeroed();
 
                             if verified? >= beta {
+                                self.stack.nmr_prior[ply] += 1;
                                 return Ok(pv.clip(lower, upper).truncate());
                             }
                         }
@@ -935,7 +958,7 @@ impl<'a> Searcher<'a> {
                         let gamma = *Params::sext_dominance_model(0);
                         let delta = *Params::sext_dominance_model(1);
                         let diff = se_beta.cast::<f32>() - se_score.cast::<f32>();
-                        let dominance = (1.0 + diff.mul_add(gamma, delta).exp()).recip();
+                        let dominance = diff.mul_add(gamma, delta).sigmoid();
 
                         extension = convolve([
                             (1.0, Params::sext_scalar(..)),
@@ -981,9 +1004,8 @@ impl<'a> Searcher<'a> {
                 }
             }
 
-            let mut lmr = Self::lmr(depth, index);
+            let mut lmr = Self::lmr(depth, index.cast());
             let lmr_depth = (depth - lmr).max(0.0);
-            let is_quiet = m.is_quiet();
 
             if !is_check && !gives_direct_check && !tail.is_losing() {
                 if depth < *Params::futility_depth_limit(0) {
@@ -1009,13 +1031,14 @@ impl<'a> Searcher<'a> {
             let ctx = MoveContext::new(&PositionContext::new(pos), pos, m);
             let butterfly = self.local.histories.butterfly.get(ctx);
             let counter = match pos.ply().get() {
-                1.. => self.stack.continuation(1).filter(|_| is_quiet).get(ctx),
+                1.. => self.stack.continuation(1).filter(|_| ctx.is_quiet).get(ctx),
                 ..1 => 0.0,
             };
 
             let mut next = self.next(Some(m));
             let gives_check = next.stack.pos.is_check();
             let raised_alpha = tail >= alpha;
+            let is_quiet = ctx.is_quiet;
 
             lmr += convolve([
                 (1.0, Params::lmr_not_root(..)),
@@ -1054,6 +1077,10 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        if tail >= beta {
+            self.stack.cuts[ply] += 1;
+        }
+
         if tail >= beta && !tail.is_decisive() && !alpha.is_decisive() {
             let s = tail.cast();
             let b = beta.cast();
@@ -1088,6 +1115,9 @@ impl<'a> Searcher<'a> {
         depth: f32,
         bounds: Range<Score>,
     ) -> Result<Pv, Interrupted> {
+        self.stack.nmr_prior[1] = 0;
+        self.stack.cuts[2] = 0;
+
         let (alpha, beta) = (bounds.start, bounds.end);
         if self.ctrl.check(depth.saturate(), zeroed(), &self.stack.pv) != Continue {
             return Err(Interrupted);
@@ -1122,7 +1152,7 @@ impl<'a> Searcher<'a> {
             self.stack.attention = self.ctrl.attention(m);
 
             let mut next = self.next(Some(m));
-            let mut lmr = Self::lmr(depth, index);
+            let mut lmr = Self::lmr(depth, index.cast());
             let gives_check = next.stack.pos.is_check();
             let raised_alpha = tail >= alpha;
             let is_quiet = m.is_quiet();
